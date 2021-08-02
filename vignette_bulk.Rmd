@@ -1,0 +1,456 @@
+---
+title: "Bulk RNA-Seq Analysis"
+author: "Daniele Colombo"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+options(max.print=10000)
+```
+
+```{r, wd, echo=FALSE}
+setwd("/home/daniele/Documenti/BCG/Trascriptomics/Project/bulk/")
+```
+# Introduction
+In this report, a bulk-RNA seq analysis is described comparing samples from brain, heart
+and colon. Three samples from each tissue are retrieved from a bigger dataset and, once
+preprocessed, they are used in order to find differentially expressed genes that characterize
+one tissue with respect to the other ones.
+
+## Used packages
+The main steps for bulk RNA-Seq analysis are performed with the `edgeR` package. For plotting,
+`ggplot2` is used and the package `SummarizedExperiments` is used to store and perform some operations
+on the data (together with `recount`):
+```{r, libraries}
+library("edgeR")
+library("ggplot2")
+library("SummarizedExperiment")
+library("recount")
+```
+
+
+# Data loading and preprocessing
+The data used for this analysis is contained inside of bigger datasets which consists of 10
+samples from each tissue. Each of the dataset is a RangedSummarizedExperiment
+object, containing a count matrix and some metadata for each row (gene) and for each column (sample).
+
+Once loaded the datasets for each tissue are preprocessed separately with an ad hoc function,
+such that the following operations are performed:
+
+* Only the wanted columns are kept
+* Only genes longer than 200 bp are kept
+* Mitochondrial genes are removed
+
+The output of this function would be for each dataset a list containing the filtered dataset
+and some pre-processing statistics:
+
+* The filtered RangedSummarizedExperiment
+* The total number of reads for each sample
+* The number of short reads (shorter than 200 bp) for each sample
+* The percentage of short reads for each sample
+* The number of mitochondrial reads for each sample
+* The percentage of mitochondrial reads for each sample
+
+```{r, preprocess-function}
+preprocess <- function(dataset_name, columns) {
+  
+  # Load the dataset and select the columns
+  dataset <- get(load(dataset_name))
+  dataset <- dataset[,columns]
+  
+  # Set the conditions for filtering
+  length_condition <- dataset@rowRanges$bp_length>=200
+  #chrM_condition <- !(sapply(sapply(rowData(dataset)$symbol, grepl, pattern="^MT-*"), any))
+  chrM_condition <- as.vector(seqnames(dataset@rowRanges)!="chrM")
+  
+  # Get the count table and compute results from filtering
+  count_table <- assays(dataset)[[1]]
+  total_reads <- colSums(count_table)
+  
+  # Count short reads
+  short_reads <- colSums(count_table[!length_condition,])
+  short_reads_perc <- (short_reads/total_reads)*100
+  
+  # Count reads on mt genes
+  mt_reads <- colSums(count_table[!chrM_condition & length_condition,])
+  mt_reads_perc <- (mt_reads/total_reads)*100
+  
+  # Filter the dataset
+  dataset <- dataset[length_condition & chrM_condition,]
+
+  # Return a list with the processed dataset and the results from filtering
+  result = list(dataset = dataset, total_reads = total_reads,
+                short_reads = short_reads, short_reads_perc = short_reads_perc,
+                mt_reads = mt_reads, mt_reads_perc = mt_reads_perc)
+  return(result)
+}
+```
+
+The function is then used to preprocess the datasets that are stored locally:
+
+```{r, preprocess}
+# Preprocess brain
+brain_preprocessed <- preprocess("rse_gene_brain_9_scaled.Rdata",c(8,9,10))
+
+# Preprocess heart
+heart_preprocessed <- preprocess("rse_gene_heart_6_scaled.Rdata",c(2,3,4))
+
+# Preprocess colon
+colon_preprocessed <- preprocess("rse_gene_colon_5_scaled.Rdata",c(1,2,3))
+```
+
+The following are the resulting pre-processing statistics:
+```{r, preprocess-stats}
+brain_tab <- vapply(brain_preprocessed[2:6], unlist, numeric(3))
+heart_tab <- vapply(heart_preprocessed[2:6], unlist, numeric(3))
+colon_tab <- vapply(colon_preprocessed[2:6], unlist, numeric(3))
+
+tab <- as.data.frame(rbind(brain_tab, heart_tab, colon_tab))
+tab
+```
+
+
+The three filtered datasets are then stored in a single RangedSummarizedExperiment object in order
+to perform the analysis and the count table is extracted:
+```{r, merge-dataset}
+merged_dataset <- cbind(brain_preprocessed$dataset, heart_preprocessed$dataset,
+                        colon_preprocessed$dataset)
+count_table <- assays(merged_dataset)[[1]]
+head(count_table)
+```
+
+
+# DE genes analysis with edgeR
+To start the bulk RNA-Seq analysis, the count table needs to be converted into a DGEList object,
+which contains all the data stored in a better way for usage with edgeR and allows to subsequently
+add further data derived from the following steps of the analysis itself:
+```{r, DGE-create}
+DGE <- DGEList(counts=count_table)
+paste("Number of genes:", dim(DGE$counts)[1])
+```
+
+The first data to add to the DGEList is the definition of groups in which the samples can be
+divided. In this case, the groups are defined by the tissues:
+```{r, DGE-groups}
+group <- as.factor(rep(c("brain","heart","colon"), each=3))
+DGE$samples$group <- group
+```
+
+The resulting DGEList is the starting point for the bulk analysis:
+```{r, DGE-show, echo=FALSE}
+head(DGE)
+```
+
+
+## Genes filtering
+In order to remove genes with counts that are overall low or equal to 0, the following function
+from `edgeR` is used with default parameters:
+```{r, filtering}
+keep_exprs <- filterByExpr(DGE, group=group)
+DGE <- DGE[keep_exprs,, keep.lib.sizes=FALSE]
+paste("Number of discarded genes:", sum(!keep_exprs))
+
+paste("Number of retained genes:", sum(keep_exprs))
+```
+
+
+## Data normalization and logCPM computation
+After filtering genes, the data is normalized with the default edgeR method, which is TMM, that
+uses for normalization a trimmed scaling factor for each column (sample). The read counts are
+then stored as the logarithm of the Counts Per Million (CPM):
+```{r}
+logcpm_before <- cpm(DGE, log=TRUE) # store the cpm values before TMM normalization
+DGE <- calcNormFactors(DGE, method = "TMM")
+logcpm <- cpm(DGE, log=TRUE)
+DGE$samples # Samples with their scaling factor
+```
+
+With the following boxplots, we can observe the distribution of the log(CPM) in each sample before and after the normalization:
+```{r, logcpm-boxplots, fig.show="hold"}
+# Reshape the datasets for logcpm vertically
+logcpm_before_plot <- reshape2::melt(logcpm_before)
+logcpm_before_plot$Tissue <- rep(c("Brain","Heart","Colon"),
+                          each=sum(logcpm_before_plot$Var2 == logcpm_before_plot$Var2[1])*3)
+
+logcpm_plot <- reshape2::melt(logcpm)
+logcpm_plot$Tissue <- rep(c("Brain","Heart","Colon"),
+                          each=sum(logcpm_plot$Var2 == logcpm_plot$Var2[1])*3)
+
+# Plot the distributions
+ggplot(data = logcpm_before_plot, aes(x=Var2, y=value, fill=Tissue))+
+  geom_boxplot(outlier.shape = NA) + ylim(-5,15) +
+  ylab("log2(CPM)") + xlab("Sample")+ ggtitle("log2(CPM) before TMM normalization") +
+  theme(axis.text=element_text(size=7))
+ggplot(data = logcpm_plot, aes(x=Var2, y=value, fill=Tissue))+
+  geom_boxplot(outlier.shape = NA) + ylim(-5,15) +
+  ylab("log2(CPM)") + xlab("Sample")+ ggtitle("log2(CPM) after TMM normalization") +
+  theme(axis.text=element_text(size=7))
+```
+
+As can be seen from the two plots, the distribution of the log2(CPM) along the different samples
+is more or less the same after the normalization. The change given by the scaling factors is not
+drastical, but can nevertheless be seen.
+
+
+## Linear model design
+Since different tissues are compared and there isn't a reference condition to compare to
+other ones, no intercept is used in the linear model. The features used in the linear
+model are the tissue to which the samples come from, which will be selected in alphabetical order,
+i.e. brain, colon and heart:
+```{r, linear-model}
+design <- model.matrix(~0+group, data=DGE$samples)
+colnames(design) <- levels(DGE$samples$group)
+design
+```
+
+
+## Exploratory analysis {.tabset .tabset-fade .tabset-pills}
+In order to evaluate the similarity between the different samples used for each tissue,
+they can be plotted in a two-dimensional space such that their distance in the plot approximates
+their expression difference. This is done through dimensionality reduction of gene expression,
+and the two main methods that can be used are Multidimensional Scaling (MDS) and Principal
+Components Analysis (PCA):
+
+### MDS plot { .unnumbered}
+```{r, MDS}
+ggplot_col <- c("#F8766D","#619CFF","#00BA38") # store standard ggplot colors
+
+# Plot with MDS
+plotMDS(logcpm, labels=colnames(logcpm), main="MDS projection of log2(CPM)",
+        col=rep(ggplot_col,each=3), xlim=c(-6,5), ylim=c(-3,5))
+legend(3.5,4.8,legend=c("Brain","Heart","Colon"), fill = ggplot_col )
+```
+
+As can be seen, the samples of each tissue are quite similar to each other and cluster well
+together.
+
+### PCA plot { .unnumbered}
+```{r, PCA}
+# Plot with PCA
+ggplot_col <- c("#F8766D","#619CFF","#00BA38") # store standard ggplot colors
+
+plotMDS(logcpm, labels=colnames(logcpm), main="PCA projection of log2(CPM)", gene.selection="common",
+        col=rep(ggplot_col, each=3), xlim=c(-6,5), ylim=c(-4,5))
+legend(3.5,4.8,legend=c("Brain","Heart","Colon"), fill = ggplot_col)
+```
+
+As can be seen, the samples of each tissue are quite similar to each other and cluster well
+together.
+
+## {-}
+In order to fit the model used by edgeR it's necessary to evaluate if the normalized 
+counts can be modeled with a Negative Binomial distribution, which is used by edgeR itself
+to model the variability of counts. In order to do that, the following plot is produced
+showing as estimate for the dispersion of the NB the Biological Coefficient of Variation (BCV):
+```{r, BCV}
+DGE <- estimateDisp(DGE, design)
+plotBCV(DGE, main="Average and Biological Coefficient of Variation of read counts")
+```
+
+The datasets have the following common dispersion estimate, which is reasonable:
+```{r, common-dispersion}
+DGE$common.dispersion
+```
+
+
+## Model fitting
+With the next command, edgeR performs parameters estimation for the fitting of the
+negative binomial distribution on the counts:
+```{r, fitting}
+fit <- glmQLFit(DGE, design)
+```
+
+
+## DE genes {.tabset .tabset-fade .tabset-pills}
+After fitting the model, the differentially expressed genes can be found by comparing
+the different tissues. In these comparisons, the genes will be considered:
+
+* Up-regulated if their FDR is lower than 0.01 and their logFC is higher than 0
+* Down-regulated if their FDR is lower than 0.01 and their logFC is lower than 0
+
+With the following code, the comparisons made between tissues are:
+
+* Brain versus colon
+* Brain versus heart
+* Colon versus heart
+
+### Brain versus colon { .unnumbered}
+```{r, brainVScolon}
+# 1vs2: brain versus colon
+qlf.1vs2 <- glmQLFTest(fit, contrast=c(1,-1,0))
+
+# select the significant ones, with corrected p-value (FDR) < 0.05: colon versus brain
+FDR.1vs2 <- p.adjust(qlf.1vs2$table$PValue, method="BH")
+summary(decideTests(qlf.1vs2, p.value=0.05))
+```
+With these thresholds, the up-regulated and down-regulated genes of brain with respect to colon
+are respectively 2130 and 2341.
+
+```{r, brainVScolon2}
+# Filter table by FDR and store up and down regulated genes
+deg.1vs2 <- topTags(qlf.1vs2, n=20000, adjust.method = "BH", sort.by = "PValue", p.value = 0.05)$table
+up.genes.1vs2 <- row.names(deg.1vs2[deg.1vs2$logFC > 0,])
+down.genes.1vs2 <- row.names(deg.1vs2[deg.1vs2$logFC < 0,])
+deg.1vs2
+```
+
+
+### Brain versus heart { .unnumbered}
+```{r, brainVSheart}
+# 1vs3: brain versus heart
+qlf.1vs3 <- glmQLFTest(fit, contrast=c(1,0,-1))
+
+# select the significant ones, with corrected p-value (FDR) < 0.05: heart versus brain
+FDR.1vs3 <- p.adjust(qlf.1vs3$table$PValue, method="BH")
+summary(decideTests(qlf.1vs3, p.value=0.05))
+```
+With these thresholds, the up-regulated and down-regulated genes of brain with respect to heart 
+are respectively 2040 and 2503.
+
+```{r, brainVSheart2}
+# Filter table by FDR and store up and down regulated genes
+deg.1vs3 <- topTags(qlf.1vs3, n=20000, adjust.method = "BH", sort.by = "PValue", p.value = 0.05)$table
+up.genes.1vs3 <- row.names(deg.1vs3[deg.1vs3$logFC > 0,])
+down.genes.1vs3 <- row.names(deg.1vs3[deg.1vs3$logFC < 0,])
+deg.1vs3
+```
+
+
+### Colon versus heart { .unnumbered}
+```{r, colonVSheart}
+# 2vs3: colon versus heart
+qlf.2vs3 <- glmQLFTest(fit, contrast=c(0,1,-1))
+
+# select the significant ones, with corrected p-value (FDR) < 0.05: heart versus colon
+FDR.2vs3 <- p.adjust(qlf.2vs3$table$PValue, method="BH")
+summary(decideTests(qlf.2vs3, p.value=0.05))
+```
+
+With these thresholds, the up-regulated and down-regulated genes of colon with respect to heart 
+are respectively 324 and 80.
+
+```{r, colonVSheart2}
+# Filter table by FDR and store up and down regulated genes
+deg.2vs3 <- topTags(qlf.2vs3, n=20000, adjust.method = "BH", sort.by = "PValue", p.value = 0.05)$table
+up.genes.2vs3 <- row.names(deg.2vs3[deg.2vs3$logFC > 0,])
+down.genes.2vs3 <- row.names(deg.2vs3[deg.2vs3$logFC < 0,])
+deg.2vs3
+```
+
+
+## {-}
+The genes significantly up and down regulated for each tissue are then retrieved by intersecting
+the two comparisons performed for each tissue with respect to the other two:
+```{r, up-down}
+# Brain (tissue 1)
+up.brain <- intersect(up.genes.1vs2, up.genes.1vs3)
+down.brain <- intersect(down.genes.1vs2, down.genes.1vs3)
+
+# Colon (tissue 2)
+up.colon <- intersect(up.genes.2vs3, down.genes.1vs2)
+down.colon <- intersect(down.genes.2vs3, up.genes.1vs2)
+
+# Heart (tissue 3)
+up.heart <- intersect(down.genes.1vs3, down.genes.2vs3)
+down.heart <- intersect(up.genes.1vs3, up.genes.2vs3)
+```
+
+
+# Saving data to .xlsx file
+In order to share the data in a more easily readable format, the data retrieved is stored in
+an excel spreadsheet, with different sheets containing:
+
+1. Up and down regulated genes of brain with respect to colon
+2. Up and down regulated genes of brain with respect to heart 
+3. Up and down regulated genes of colon with respect to heart
+4. Up and down regulated genes of brain with respect to the other two tissues
+5. Up and down regulated genes of colon with respect to the other two tissues
+6. Up and down regulated genes of heart with respect to the other two tissues
+
+Firstly, the gene names are stored in a properly formatted dataset containing up and down
+regulated genes in two columns with the following function:
+```{r, dataset-function, eval=FALSE}
+de.genes.dataframe <- function(col1, col2, column.names) {
+  de.genes <- data.frame(col1 = rep(NA, max(sapply(list(col1, col2), length))))
+  de.genes[1:length(col1),1] <- col1
+  de.genes[1:length(col2),2] <- col2
+  colnames(de.genes) <- column.names
+  
+  return(de.genes)
+}
+
+
+comparison.1vs2 <- de.genes.dataframe(up.genes.1vs2,down.genes.1vs2,
+                                        c("up.brain.vs.colon","down.brain.vs.colon"))
+comparison.1vs3 <- de.genes.dataframe(up.genes.1vs3,down.genes.1vs3,
+                                        c("up.brain.vs.heart","down.brain.vs.heart"))
+comparison.2vs3 <- de.genes.dataframe(up.genes.2vs3,down.genes.2vs3,
+                                        c("up.colon.vs.heart","down.colon.vs.heart"))
+de.genes.brain <- de.genes.dataframe(up.brain, down.brain, c("up.brain","down.brain"))
+de.genes.colon <- de.genes.dataframe(up.colon, down.colon, c("up.colon","down.colon"))
+de.genes.heart <- de.genes.dataframe(up.heart, down.heart, c("up.heart","down.heart"))
+```
+
+The dataframes are then stored in the .xlsx file with the function provided by the package
+`xlsx`:
+```{r, write-xlsx, eval=FALSE}
+xlsx::write.xlsx(comparison.1vs2, "DE_genes.xlsx", sheetName = "Tissue 1 vs 2",
+                 col.names = TRUE, row.names = FALSE, append = FALSE, showNA=FALSE)
+xlsx::write.xlsx(comparison.1vs3, "DE_genes.xlsx", sheetName = "Tissue 1 vs 3",
+                 col.names = TRUE, row.names = FALSE, append = TRUE, showNA=FALSE)
+xlsx::write.xlsx(comparison.2vs3, "DE_genes.xlsx", sheetName = "Tissue 2 vs 3",
+                 col.names = TRUE, row.names = FALSE, append = TRUE, showNA=FALSE)
+xlsx::write.xlsx(de.genes.brain, "DE_genes.xlsx", sheetName = "DE genes tissue 1",
+                 col.names = TRUE, row.names = FALSE, append = TRUE, showNA=FALSE)
+xlsx::write.xlsx(de.genes.colon, "DE_genes.xlsx", sheetName = "DE genes tissue 2",
+                 col.names = TRUE, row.names = FALSE, append = TRUE, showNA=FALSE)
+xlsx::write.xlsx(de.genes.heart, "DE_genes.xlsx", sheetName = "DE genes tissue 3",
+                 col.names = TRUE, row.names = FALSE, append = TRUE, showNA=FALSE)
+```
+
+
+# Functional Enrichment Analysis
+In order to perform functional enrichment for this analysis, [Enrichr](https://maayanlab.cloud/Enrichr/) was used.
+Since it accepts only gene symbols as search input, the ensembl gene IDs stored in the 
+RangedSummarizedExperiments need to be converted. The function `mapIds` from the package
+`AnnotationDbi` is used for this task and in case of mapping of one ensembl ID to multiple
+gene symbols the first symbol is used.
+For this conversion to work, the version of the ensembl ID is removed with `gsub`.
+Finally, the gene symbols are stored in a .txt file:
+```{r, symbols, eval=FALSE}
+write.gene.symbols <- function(ensembl, file.name) {
+  symbols <- mapIds(org.Hs.eg.db, keys=gsub("\\..*", "", ensembl),
+         keytype="ENSEMBL", column="SYMBOL", multiVals="first")
+  write.table(symbols[!is.na(symbols)],file.name,col.names = F,row.names = F,quote=F)
+}
+
+write.gene.symbols(up.brain,"up_brain_symbols.txt")
+write.gene.symbols(up.colon,"up_colon_symbols.txt")
+write.gene.symbols(up.heart,"up_heart_symbols.txt")
+```
+
+
+# Session info
+The code was run under the following R session:
+```{r, echo=FALSE}
+print(sessionInfo(), nrow=(1000))
+```
+
